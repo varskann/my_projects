@@ -3,17 +3,21 @@ train.py: training and evaluation logic goes here
 """
 
 __author__ = "Kanishk Varshney"
-__date__ = "Sun Sep  1 22:56:12 IST 2019"
+__date__ = "Sun Sep 24 22:56:12 IST 2019"
 
 import os
 import argparse
+import itertools
 
 import torch
 import torch.optim as optim
 import torch.nn as nn
 from torch.utils import data
+from torch.autograd import Variable
+import torchvision.transforms as transforms
 # import torchvision
 
+from PIL import Image
 import wandb
 from sklearn.metrics import confusion_matrix
 import numpy as np
@@ -41,41 +45,90 @@ def main(args):
     train_batch_size = utils.get_config("training", "batch_size", _type=int)
     val_batch_size = utils.get_config("validation", "batch_size", _type=int)
     max_epochs = utils.get_config("training", "epoch", _type=int)
+    decay_epoch = utils.get_config("training", "decay_epoch", _type=int)
     params["num_classes"] = utils.get_config("classes", "num_classes", _type=int)
     params["log_interval"] = utils.get_config("code", "log_interval", _type=int)
     params["classes"] = utils.get_class_names()
 
     ## fetch the model
     params["device"] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    params["net"] = models.Model().to(params["device"])
-    wandb.watch(params["net"], log="all")
 
-    params["optimizer"] = optim.SGD(params["net"].parameters(),
-                                    lr=learning_rate,
-                                    momentum=momentum)
+    ## Load models
+    params["netG_A2B"] = models.Generator().to(params["device"])
+    params["netG_B2A"] = models.Generator().to(params["device"])
+    params["netD_A"] = models.Descriminator().to(params["device"])
+    params["netD_B"] = models.Descriminator().to(params["device"])
 
-    params["loss_fn"] = nn.CrossEntropyLoss()
+    params["netG_A2B"].apply(utils.weights_init_normal)
+    params["netG_B2A"].apply(utils.weights_init_normal)
+    params["netD_A"].apply(utils.weights_init_normal)
+    params["netD_B"].apply(utils.weights_init_normal)
 
+    # wandb.watch(params["net"], log="all")
+
+    # Lossess
+    params["criterion_GAN"] = nn.MSELoss()
+    params["criterion_cycle"] = nn.L1Loss()
+    params["criterion_identity"] = nn.L1Loss()
+
+    # Optimizers & LR schedulers
+    params["optimizer_G"] = optim.Adam(itertools.chain(params["netG_A2B"].parameters(),
+                                                       params["netG_B2A"].parameters()),
+                                       lr=learning_rate, betas=(0.5, 0.999))
+    params["optimizer_D_A"] = optim.Adam(params["netD_A"].parameters(), lr=learning_rate, betas=(0.5, 0.999))
+    params["optimizer_D_B"] = optim.Adam(params["netD_B"].parameters(), lr=learning_rate, betas=(0.5, 0.999))
+
+    params["lr_scheduler_G"] = optim.lr_scheduler.LambdaLR(params["optimizer_G"],
+                                                           lr_lambda=utils.LambdaLR(max_epochs, 0, decay_epoch).step)
+    params["lr_scheduler_D_A"] = optim.lr_scheduler.LambdaLR(params["optimizer_D_A"],
+                                                             lr_lambda=utils.LambdaLR(max_epochs, 0, decay_epoch).step)
+    params["lr_scheduler_D_B"] = optim.lr_scheduler.LambdaLR(params["optimizer_D_B"],
+                                                             lr_lambda=utils.LambdaLR(max_epochs, 0, decay_epoch).step)
+
+    # Dataset loader
+    transforms_ = [transforms.Resize(int(256 * 1.12), Image.BICUBIC),
+                   transforms.RandomCrop(256),
+                   transforms.RandomHorizontalFlip(),
+                   transforms.ToTensor(),
+                   transforms.Normalize((0.5,), (0.5,))]
 
     ## load data
-    train_data = dataset.Dataset(root_dir=args.data, filepath=args.train)
+    train_data = dataset.ImageDataset(args.data,
+                                      transforms_=transforms_,
+                                      unaligned=True,
+                                      mode="train")
     params["train_data_loader"] = data.DataLoader(train_data,
                                                   num_workers=num_workers,
                                                   batch_size=train_batch_size,
                                                   shuffle=True,
                                                   pin_memory=True)
 
-    val_data = dataset.Dataset(root_dir=args.data, filepath=args.validation)
-    params["val_data_loader"] = data.DataLoader(val_data,
-                                                num_workers=num_workers,
-                                                batch_size=val_batch_size,
-                                                shuffle=True,
-                                                pin_memory=True)
+    # ## load data
+    # val_data = dataset.ImageDataset(args.data,
+    #                                 transforms_=transforms_,
+    #                                 unaligned=True,
+    #                                 mode="test")
+    # params["val_data_loader"] = data.DataLoader(val_data,
+    #                                             num_workers=num_workers,
+    #                                             batch_size=train_batch_size,
+    #                                             shuffle=True,
+    #                                             pin_memory=True)
 
+    Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.Tensor
+    params["input_A"] = Tensor(train_batch_size, 3, 256, 256)
+    params["input_B"] = Tensor(train_batch_size, 3, 256, 256)
+    params["target_real"] = Variable(Tensor(train_batch_size).fill_(1.0), requires_grad=False)
+    params["target_fake"] = Variable(Tensor(train_batch_size).fill_(0.0), requires_grad=False)
+
+    params["fake_A_buffer"] = utils.ReplayBuffer()
+    params["fake_B_buffer"] = utils.ReplayBuffer()
+
+
+    # params["logger"] = utils.Logger(max_epochs, len(params["train_data_loader"]))
     ## trigger training
     for _epoch in range(max_epochs):
         train(params, _epoch)
-        test(params, _epoch)
+        # test(params, _epoch)
 
 
 def train(params, epoch):
@@ -88,79 +141,107 @@ def train(params, epoch):
     :return:
     """
     ## set mode to train
-    params["net"].train()
-    train_loss_total = 0.0
-    correct_predictions_total = 0.0
-    correct_arr = [0.0] * params["num_classes"]
-    total_arr = [0.0] * params["num_classes"]
-    target_labels_epoch = []
-    predicted_labels_epoch = []
-    for batch_idx, sample in enumerate(params["train_data_loader"]):
-        images = sample["image"].to(params["device"])
-        target_labels = sample["label"].to(params["device"])
-        target_labels_epoch.extend(target_labels)
 
-        ## train the network iteration
-        params["optimizer"].zero_grad()
-        output_probs = params["net"](images)
-        train_loss = params["loss_fn"](output_probs, target_labels)
+    for _, batch in enumerate(params["train_data_loader"]):
+        real_A = Variable(params["input_A"].copy_(batch['A']))
+        real_B = Variable(params["input_B"].copy_(batch['B']))
 
-        train_loss.backward()
-        params["optimizer"].step()
+        ####### train the generator network iteration ########
+        params["optimizer_G"].zero_grad()
 
-        # calculate and log TRAINING performance metrics (PER ITERATION)
-        _, predicted_labels = torch.max(output_probs.data, 1)
-        predicted_labels_epoch.extend(predicted_labels)
+        ## Identity loss
+        # G_A2B(B) should equal B if real B is fed
 
-        correct_predictions = (predicted_labels == target_labels).sum()
-        total_predictions = target_labels.size(0)
+        same_B = params["netG_A2B"](real_B)
+        loss_identity_B = params["criterion_identity"](same_B, real_B) * 5.0
+        # G_B2A(A) should equal A if real A is fed
+        same_A = params["netG_B2A"](real_A)
+        loss_identity_A = params["criterion_identity"](same_A, real_A) * 5.0
 
-        train_loss_total += train_loss.item()
-        accuracy = 100.0 * correct_predictions / total_predictions
+        # GAN loss
+        fake_B = params["netG_A2B"](real_A)
+        pred_fake = params["netD_B"](fake_B)
+        loss_GAN_A2B = params["criterion_GAN"](pred_fake, params["target_real"])
 
-        training_metrics_per_batch = {'training accuracy (per batch)': accuracy,
-                                      'training loss (per batch)': train_loss.item()}
-        wandb.log(training_metrics_per_batch)
+        fake_A = params["netG_B2A"](real_B)
+        pred_fake = params["netD_A"](fake_A)
+        loss_GAN_B2A = params["criterion_GAN"](pred_fake, params["target_real"])
 
-        ## Log trainign progress at every LOG_INTERVAL
-        if batch_idx % params["log_interval"] == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\t'
-                  'Loss: {:.6f}'.format(epoch,
-                                        batch_idx*len(images),
-                                        len(params["train_data_loader"].dataset),
-                                        100. * batch_idx / len(params["train_data_loader"]),
-                                        train_loss.item()))
+        # Cycle loss
+        recovered_A = params["netG_B2A"](fake_B)
+        loss_cycle_ABA = params["criterion_cycle"](recovered_A, real_A) * 10.0
+
+        recovered_B = params["netG_A2B"](fake_A)
+        loss_cycle_BAB = params["criterion_cycle"](recovered_B, real_B) * 10.0
+
+        # Total loss
+        loss_G = loss_identity_A + loss_identity_B + loss_GAN_A2B + loss_GAN_B2A + loss_cycle_ABA + loss_cycle_BAB
+        loss_G.backward()
+
+        params["optimizer_G"].step()
+        #########################################
+
+        ####### train discriminator #######
+
+        ## Discriminator A
+        params["optimizer_D_A"].zero_grad()
+
+        pred_real = params["nedD_A"](real_A)
+        loss_D_real = params["criterion_GAN"](pred_real, params["target_real"])
+
+        # Fake loss
+        fake_A = params["fake_A_buffer"].push_and_pop(fake_A)
+        pred_fake = params["netD_A"](fake_A.detach())
+        loss_D_fake = params["criterion_GAN"](pred_fake, params["target_fake"])
+
+        # Total loss
+        loss_D_A = (loss_D_real + loss_D_fake) * 0.5
+        loss_D_A.backward()
+
+        params["optimizer_D_A"].step()
+
+        ## Discriminator B
+        params["optimizer_D_B"].zero_grad()
+
+        pred_real = params["nedD_B"](real_B)
+        loss_D_real = params["criterion_GAN"](pred_real, params["target_real"])
+
+        # Fake loss
+        fake_B = params["fake_B_buffer"].push_and_pop(fake_B)
+        pred_fake = params["netD_B"](fake_B.detach())
+        loss_D_fake = params["criterion_GAN"](pred_fake, params["target_fake"])
+
+        # Total loss
+        loss_D_B = (loss_D_real + loss_D_fake) * 0.5
+        loss_D_B.backward()
+
+        params["optimizer_D_B"].step()
 
 
-    ## calculate and log TRAINING performance metrics (PER EPOCH)
-    correct_predictions_total = (np.array(predicted_labels_epoch) == np.array(target_labels_epoch)).sum()
+        # Progress report (http://localhost:8097)
 
-    confusion_matrix =  wandb.Image(utils.plot_confusion_matrix(target_labels_epoch,
-                                                                predicted_labels_epoch,
-                                                                classes=params["classes"]))
+        wandb.log({'loss_G': loss_G,
+                   'loss_G_identity': (loss_identity_A + loss_identity_B),
+                   'loss_G_GAN': (loss_GAN_A2B + loss_GAN_B2A),
+                    'loss_G_cycle': (loss_cycle_ABA + loss_cycle_BAB),
+                   'loss_D': (loss_D_A + loss_D_B)},
+                    images={'real_A': wandb.Image(real_A), 'real_B': wandb.Image(real_B),
+                            'fake_A': wandb.Image(fake_A), 'fake_B': wandb.Image(fake_B)})
 
-    train_loss_total /= len(params["train_data_loader"].dataset)
-    train_accuracy_epoch = 100.0 * correct_predictions_total / len(params["train_data_loader"].dataset)
-    training_metrics_per_epoch = {"training loss (per epoch)": train_loss_total,
-                                  "training accuracy (per epoch)": train_accuracy_epoch,
-                                  "training confusion matrix (per epoch)": confusion_matrix}
-    wandb.log(training_metrics_per_epoch)
 
     """
     =================================== save the model after every epoch ===============================================
     """
-    model_state = {
-        'epoch': epoch,
-        'state_dict': params["net"].state_dict(),
-        'optimizer': params["optimizer"].state_dict()
-    }
+    # Update learning rates
+    params["lr_scheduler_G"].step()
+    params["lr_scheduler_D_A"].step()
+    params["lr_scheduler_D_B"].step()
 
-    model_dir = "checkpoints/{}".format(params["model_name"])
-    if not os.path.exists(model_dir):
-        os.makedirs(model_dir)
-
-    model_outfile = os.path.join(model_dir, "{}_{}.pth".format(params["model_name"], epoch))
-    torch.save(model_state, model_outfile)
+    # Save models checkpoints
+    torch.save(params["netG_A2B.state_dict()"], 'checkpoints/netG_A2B.pth')
+    torch.save(params["netG_B2A.state_dict()"], 'checkpoints/netG_B2A.pth')
+    torch.save(params["netD_A.state_dict()"], 'checkpoints/netD_A.pth')
+    torch.save(params["netD_B.state_dict()"], 'checkpoints/netD_B.pth')
     """
     ____________________________________________________________________________________________________________________
     """
@@ -244,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--validation", type=str, default="", help="path to validation file")
     parser.add_argument("--test", type=str, default="", help="path to test file for evaluation")
     parser.add_argument("--data", type=str, default="", help="path to data in training/validation/test file")
-    parser.add_argument("--model_name", type=str, required=True, help="model versioning")
+    parser.add_argument("--model_name", type=str, required=False, help="model versioning")
 
     cmd_args = parser.parse_args()
 
